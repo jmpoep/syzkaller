@@ -14,14 +14,30 @@ create_table=$( echo -n '
 CREATE TABLE
   files (
     "session" text,
+    "manager" text,
     "filepath" text,
     "instrumented" bigint,
     "covered" bigint,
     "linesinstrumented" bigint[],
     "hitcounts" bigint[],
-    "manager" text,
   PRIMARY KEY
     (session, manager, filepath) );')
+gcloud spanner databases ddl update $db --instance=syzbot --project=syzkaller \
+ --ddl="$create_table"
+
+echo "drop table 'functions' if exists"
+gcloud spanner databases ddl update $db --instance=syzbot --project=syzkaller \
+--ddl="DROP TABLE IF EXISTS functions"
+echo "create table 'functions'"
+create_table=$( echo -n '
+CREATE TABLE
+  functions (
+    "session" text,
+    "filepath" text,
+    "funcname" text,
+    "lines" bigint[],
+  PRIMARY KEY
+    (session, filepath, funcname) );')
 gcloud spanner databases ddl update $db --instance=syzbot --project=syzkaller \
  --ddl="$create_table"
 

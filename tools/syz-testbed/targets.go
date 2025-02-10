@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"log"
 	"math/rand"
 	"os"
@@ -20,7 +21,7 @@ import (
 // TestbedTarget represents all behavioral differences between specific testbed targets.
 type TestbedTarget interface {
 	NewJob(slotName string, checkouts []*Checkout) (*Checkout, Instance, error)
-	SaveStatView(view StatView, dir string) error
+	SaveStatView(view *StatView, dir string) error
 	SupportsHTMLView(key string) bool
 }
 
@@ -41,11 +42,11 @@ var targetConstructors = map[string]func(cfg *TestbedConfig) TestbedTarget{
 		inputFiles := []string{}
 		reproConfig := cfg.ReproConfig
 		if reproConfig.InputLogs != "" {
-			err := filepath.Walk(reproConfig.InputLogs, func(path string, info os.FileInfo, err error) error {
+			err := filepath.WalkDir(reproConfig.InputLogs, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
-				if !info.IsDir() {
+				if !d.IsDir() {
 					inputFiles = append(inputFiles, path)
 				}
 				return nil
@@ -129,16 +130,16 @@ func (t *SyzManagerTarget) SupportsHTMLView(key string) bool {
 	return supported[key]
 }
 
-func (t *SyzManagerTarget) SaveStatView(view StatView, dir string) error {
+func (t *SyzManagerTarget) SaveStatView(view *StatView, dir string) error {
 	benchDir := filepath.Join(dir, "benches")
 	err := osutil.MkdirAll(benchDir)
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %w", benchDir, err)
 	}
-	tableStats := map[string]func(view StatView) (*Table, error){
-		"bugs.csv":           (StatView).GenerateBugTable,
-		"checkout_stats.csv": (StatView).StatsTable,
-		"instance_stats.csv": (StatView).InstanceStatsTable,
+	tableStats := map[string]func(view *StatView) (*Table, error){
+		"bugs.csv":           (*StatView).GenerateBugTable,
+		"checkout_stats.csv": (*StatView).StatsTable,
+		"instance_stats.csv": (*StatView).InstanceStatsTable,
 	}
 	for fileName, genFunc := range tableStats {
 		table, err := genFunc(view)
@@ -246,12 +247,12 @@ func (t *SyzReproTarget) SupportsHTMLView(key string) bool {
 	return supported[key]
 }
 
-func (t *SyzReproTarget) SaveStatView(view StatView, dir string) error {
-	tableStats := map[string]func(view StatView) (*Table, error){
-		"repro_success.csv":   (StatView).GenerateReproSuccessTable,
-		"crepros_success.csv": (StatView).GenerateCReproSuccessTable,
-		"repro_attempts.csv":  (StatView).GenerateReproAttemptsTable,
-		"repro_duration.csv":  (StatView).GenerateReproDurationTable,
+func (t *SyzReproTarget) SaveStatView(view *StatView, dir string) error {
+	tableStats := map[string]func(view *StatView) (*Table, error){
+		"repro_success.csv":   (*StatView).GenerateReproSuccessTable,
+		"crepros_success.csv": (*StatView).GenerateCReproSuccessTable,
+		"repro_attempts.csv":  (*StatView).GenerateReproAttemptsTable,
+		"repro_duration.csv":  (*StatView).GenerateReproDurationTable,
 	}
 	for fileName, genFunc := range tableStats {
 		table, err := genFunc(view)

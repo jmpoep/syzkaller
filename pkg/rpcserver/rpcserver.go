@@ -28,6 +28,7 @@ import (
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/dispatcher"
+	"golang.org/x/sync/errgroup"
 )
 
 type Config struct {
@@ -50,6 +51,9 @@ type Config struct {
 	Slowdown      int
 	pcBase        uint64
 	localModules  []*vminfo.KernelModule
+
+	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
+	machineCheckStarted chan struct{}
 }
 
 type RemoteConfig struct {
@@ -63,8 +67,8 @@ type RemoteConfig struct {
 type Manager interface {
 	MaxSignal() signal.Signal
 	BugFrames() (leaks []string, races []string)
-	MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) queue.Source
-	CoverageFilter(modules []*vminfo.KernelModule) []uint64
+	MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) (queue.Source, error)
+	CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error)
 }
 
 type Server interface {
@@ -72,6 +76,7 @@ type Server interface {
 	Close() error
 	Port() int
 	TriagedCorpus()
+	Serve(context.Context) error
 	CreateInstance(id int, injectExec chan<- bool, updInfo dispatcher.UpdateInfo) chan error
 	ShutdownInstance(id int, crashed bool, extraExecs ...report.ExecutorInfo) ([]ExecRecord, []byte)
 	StopFuzzing(id int)
@@ -90,6 +95,7 @@ type server struct {
 	infoOnce         sync.Once
 	checkDone        atomic.Bool
 	checkFailures    int
+	onHandshake      chan *handshakeResult
 	baseSource       *queue.DynamicSourceCtl
 	setupFeatures    flatrpc.Feature
 	canonicalModules *cover.Canonicalizer
@@ -153,7 +159,7 @@ func New(cfg *RemoteConfig) (Server, error) {
 	if !cfg.Experimental.RemoteCover {
 		features &= ^flatrpc.FeatureExtraCoverage
 	}
-	return newImpl(context.Background(), &Config{
+	return newImpl(&Config{
 		Config: vminfo.Config{
 			Target:     cfg.Target,
 			VMType:     cfg.Type,
@@ -180,22 +186,23 @@ func New(cfg *RemoteConfig) (Server, error) {
 	}, cfg.Manager), nil
 }
 
-func newImpl(ctx context.Context, cfg *Config, mgr Manager) *server {
+func newImpl(cfg *Config, mgr Manager) *server {
 	// Note that we use VMArch, rather than Arch. We need the kernel address ranges and bitness.
 	sysTarget := targets.Get(cfg.Target.OS, cfg.VMArch)
 	cfg.Procs = min(cfg.Procs, prog.MaxPids)
-	checker := vminfo.New(ctx, &cfg.Config)
+	checker := vminfo.New(&cfg.Config)
 	baseSource := queue.DynamicSource(checker)
 	return &server{
-		cfg:        cfg,
-		mgr:        mgr,
-		target:     cfg.Target,
-		sysTarget:  sysTarget,
-		timeouts:   sysTarget.Timeouts(cfg.Slowdown),
-		runners:    make(map[int]*Runner),
-		checker:    checker,
-		baseSource: baseSource,
-		execSource: queue.Distribute(queue.Retry(baseSource)),
+		cfg:         cfg,
+		mgr:         mgr,
+		target:      cfg.Target,
+		sysTarget:   sysTarget,
+		timeouts:    sysTarget.Timeouts(cfg.Slowdown),
+		runners:     make(map[int]*Runner),
+		checker:     checker,
+		baseSource:  baseSource,
+		execSource:  queue.Distribute(queue.Retry(baseSource)),
+		onHandshake: make(chan *handshakeResult, 1),
 
 		Stats: cfg.Stats,
 		runnerStats: &runnerStats{
@@ -217,7 +224,7 @@ func (serv *server) Close() error {
 }
 
 func (serv *server) Listen() error {
-	s, err := flatrpc.ListenAndServe(serv.cfg.RPC, serv.handleConn)
+	s, err := flatrpc.Listen(serv.cfg.RPC)
 	if err != nil {
 		return err
 	}
@@ -225,15 +232,40 @@ func (serv *server) Listen() error {
 	return nil
 }
 
+func (serv *server) Serve(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return serv.serv.Serve(ctx, func(ctx context.Context, conn *flatrpc.Conn) error {
+			err := serv.handleConn(ctx, conn)
+			if err != nil {
+				log.Logf(0, "serv.handleConn returend %v", err)
+			}
+			return err
+		})
+	})
+	g.Go(func() error {
+		var info *handshakeResult
+		select {
+		case <-ctx.Done():
+			return nil
+		case info = <-serv.onHandshake:
+		}
+		// We run the machine check specifically from the top level context,
+		// not from the per-connection one.
+		return serv.runCheck(ctx, info)
+	})
+	return g.Wait()
+}
+
 func (serv *server) Port() int {
 	return serv.serv.Addr.Port
 }
 
-func (serv *server) handleConn(conn *flatrpc.Conn) {
+func (serv *server) handleConn(ctx context.Context, conn *flatrpc.Conn) error {
 	connectReq, err := flatrpc.Recv[*flatrpc.ConnectRequestRaw](conn)
 	if err != nil {
 		log.Logf(1, "%s", err)
-		return
+		return nil
 	}
 	id := int(connectReq.Id)
 	log.Logf(1, "runner %v connected", id)
@@ -246,7 +278,8 @@ func (serv *server) handleConn(conn *flatrpc.Conn) {
 			serv.ShutdownInstance(id, true)
 		}()
 	} else if err := checkRevisions(connectReq, serv.cfg.Target); err != nil {
-		log.Fatal(err)
+		// This is a fatal error.
+		return err
 	}
 	serv.StatVMRestarts.Add(1)
 
@@ -255,15 +288,22 @@ func (serv *server) handleConn(conn *flatrpc.Conn) {
 	serv.mu.Unlock()
 	if runner == nil {
 		log.Logf(2, "unknown VM %v tries to connect", id)
-		return
+		return nil
 	}
 
-	err = serv.handleRunnerConn(runner, conn)
+	err = serv.handleRunnerConn(ctx, runner, conn)
 	log.Logf(2, "runner %v: %v", id, err)
+
+	if err != nil && errors.Is(err, errFatal) {
+		log.Logf(0, "%v", err)
+		return err
+	}
+
 	runner.resultCh <- err
+	return nil
 }
 
-func (serv *server) handleRunnerConn(runner *Runner, conn *flatrpc.Conn) error {
+func (serv *server) handleRunnerConn(ctx context.Context, runner *Runner, conn *flatrpc.Conn) error {
 	opts := &handshakeConfig{
 		VMLess:   serv.cfg.VMLess,
 		Files:    serv.checker.RequiredFiles(),
@@ -278,21 +318,27 @@ func (serv *server) handleRunnerConn(runner *Runner, conn *flatrpc.Conn) error {
 		opts.Features = serv.cfg.Features
 	}
 
-	err := runner.Handshake(conn, opts)
+	info, err := runner.Handshake(conn, opts)
 	if err != nil {
 		log.Logf(1, "%v", err)
 		return err
 	}
 
+	select {
+	case serv.onHandshake <- &info:
+	default:
+	}
+
 	if serv.triagedCorpus.Load() {
 		if err := runner.SendCorpusTriaged(); err != nil {
-			log.Logf(2, "%v", err)
 			return err
 		}
 	}
-
-	return serv.connectionLoop(runner)
+	return serv.connectionLoop(ctx, runner)
 }
+
+// Used for errors incompatible with further RPCServer operation.
+var errFatal = errors.New("aborting RPC server")
 
 func (serv *server) handleMachineInfo(infoReq *flatrpc.InfoRequestRawT) (handshakeResult, error) {
 	modules, machineInfo, err := serv.checker.MachineInfo(infoReq.Files)
@@ -307,35 +353,50 @@ func (serv *server) handleMachineInfo(infoReq *flatrpc.InfoRequestRawT) (handsha
 		log.Logf(0, "machine check failed: %v", infoReq.Error)
 		serv.checkFailures++
 		if serv.checkFailures == 10 {
-			log.Fatalf("machine check failing")
+			return handshakeResult{}, fmt.Errorf("%w: machine check failed too many times", errFatal)
 		}
 		return handshakeResult{}, errors.New("machine check failed")
 	}
+	var retErr error
 	serv.infoOnce.Do(func() {
 		serv.StatModules.Add(len(modules))
 		serv.canonicalModules = cover.NewCanonicalizer(modules, serv.cfg.Cover)
-		serv.coverFilter = serv.mgr.CoverageFilter(modules)
-		// Flatbuffers don't do deep copy of byte slices,
-		// so clone manually since we pass it a goroutine.
-		for _, file := range infoReq.Files {
-			file.Data = slices.Clone(file.Data)
+		var err error
+		serv.coverFilter, err = serv.mgr.CoverageFilter(modules)
+		if err != nil {
+			retErr = fmt.Errorf("%w: %w", errFatal, err)
+			return
 		}
-		// Now execute check programs.
-		go func() {
-			if err := serv.runCheck(infoReq); err != nil {
-				log.Fatalf("check failed: %v", err)
-			}
-		}()
 	})
+	if retErr != nil {
+		return handshakeResult{}, retErr
+	}
+	// Flatbuffers don't do deep copy of byte slices,
+	// so clone manually since we may later pass it a goroutine.
+	for _, file := range infoReq.Files {
+		file.Data = slices.Clone(file.Data)
+	}
 	canonicalizer := serv.canonicalModules.NewInstance(modules)
 	return handshakeResult{
 		CovFilter:     canonicalizer.Decanonicalize(serv.coverFilter),
 		MachineInfo:   machineInfo,
 		Canonicalizer: canonicalizer,
+		Files:         infoReq.Files,
+		Features:      infoReq.Features,
 	}, nil
 }
 
-func (serv *server) connectionLoop(runner *Runner) error {
+func (serv *server) connectionLoop(baseCtx context.Context, runner *Runner) error {
+	// To "cancel" the runner's loop we need to call runner.Stop().
+	// At the same time, we don't want to leak the goroutine that monitors it,
+	// so we derive a new context and cancel it on function exit.
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		runner.Stop()
+	}()
+
 	if serv.cfg.Cover {
 		maxSignal := serv.mgr.MaxSignal().ToRaw()
 		for len(maxSignal) != 0 {
@@ -371,8 +432,15 @@ func checkRevisions(a *flatrpc.ConnectRequest, target *prog.Target) error {
 	return nil
 }
 
-func (serv *server) runCheck(info *flatrpc.InfoRequest) error {
-	enabledCalls, disabledCalls, features, checkErr := serv.checker.Run(info.Files, info.Features)
+func (serv *server) runCheck(ctx context.Context, info *handshakeResult) error {
+	if serv.cfg.machineCheckStarted != nil {
+		close(serv.cfg.machineCheckStarted)
+	}
+	enabledCalls, disabledCalls, features, checkErr := serv.checker.Run(ctx, info.Files, info.Features)
+	if checkErr == vminfo.ErrAborted {
+		return nil
+	}
+
 	enabledCalls, transitivelyDisabled := serv.target.TransitivelyEnabledCalls(enabledCalls)
 	// Note: need to print disbled syscalls before failing due to an error.
 	// This helps to debug "all system calls are disabled".
@@ -384,7 +452,10 @@ func (serv *server) runCheck(info *flatrpc.InfoRequest) error {
 	}
 	enabledFeatures := features.Enabled()
 	serv.setupFeatures = features.NeedSetup()
-	newSource := serv.mgr.MachineChecked(enabledFeatures, enabledCalls)
+	newSource, err := serv.mgr.MachineChecked(enabledFeatures, enabledCalls)
+	if err != nil {
+		return err
+	}
 	serv.baseSource.Store(newSource)
 	serv.checkDone.Store(true)
 	return nil

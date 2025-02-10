@@ -74,13 +74,12 @@ GITREVDATE=$(shell git log -n 1 --format="%cd" --date=format:%Y%m%d-%H%M%S)
 # That's only needed if you use gdb or nm.
 # If you need that, build manually without these flags.
 GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/prog.GitRevision=$(REV) -X 'github.com/google/syzkaller/prog.gitRevisionDate=$(GITREVDATE)'"
+ifneq ("$(GOTAGS)", "")
+	GOFLAGS += " -tags=$(GOTAGS)"
+endif
 
 GOHOSTFLAGS ?= $(GOFLAGS)
 GOTARGETFLAGS ?= $(GOFLAGS)
-ifneq ("$(GOTAGS)", "")
-	GOHOSTFLAGS += "-tags=$(GOTAGS)"
-endif
-GOTARGETFLAGS += "-tags=syz_target syz_os_$(TARGETOS) syz_arch_$(TARGETVMARCH) $(GOTAGS)"
 
 ifeq ("$(TARGETOS)", "test")
 	TARGETGOOS := $(HOSTOS)
@@ -149,8 +148,10 @@ descriptions:
 
 .descriptions: sys/*/*.txt sys/*/*.const bin/syz-sysgen
 	bin/syz-sysgen
-	$(GO) fmt ./sys/... >/dev/null
 	touch .descriptions
+
+go-flags:
+	@echo "${GOHOSTFLAGS}"
 
 manager: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
@@ -238,6 +239,7 @@ generate_go: format_cpp
 	$(GO) generate ./executor ./pkg/ifuzz ./pkg/build ./pkg/rpcserver
 	$(GO) generate ./vm/proxyapp
 	$(GO) generate ./pkg/coveragedb
+	$(GO) generate ./pkg/covermerger
 
 generate_rpc:
 	flatc -o pkg/flatrpc --warnings-as-errors --gen-object-api --filename-suffix "" --go --gen-onefile --go-namespace flatrpc pkg/flatrpc/flatrpc.fbs

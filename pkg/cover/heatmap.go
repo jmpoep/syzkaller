@@ -12,12 +12,10 @@ import (
 	"sort"
 	"strings"
 
-	"cloud.google.com/go/spanner"
 	"github.com/google/syzkaller/pkg/coveragedb"
 	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
 	_ "github.com/google/syzkaller/pkg/subsystem/lists"
 	"golang.org/x/exp/maps"
-	"google.golang.org/api/iterator"
 )
 
 type templateHeatmapRow struct {
@@ -70,8 +68,19 @@ func (thm *templateHeatmapRow) addParts(depth int, pathLeft []string, filePath s
 	thm.builder[nextElement].addParts(depth+1, pathLeft[1:], filePath, instrumented, covered, timePeriod)
 }
 
-func (thm *templateHeatmapRow) prepareDataFor(pageColumns []pageColumnTarget) {
-	thm.Items = maps.Values(thm.builder)
+func (thm *templateHeatmapRow) prepareDataFor(pageColumns []pageColumnTarget, skipEmpty bool) {
+	for _, item := range thm.builder {
+		if !skipEmpty {
+			thm.Items = append(thm.Items, item)
+			continue
+		}
+		for _, hitCount := range item.covered {
+			if hitCount > 0 {
+				thm.Items = append(thm.Items, item)
+				break
+			}
+		}
+	}
 	sort.Slice(thm.Items, func(i, j int) bool {
 		if thm.Items[i].IsDir != thm.Items[j].IsDir {
 			return thm.Items[i].IsDir
@@ -89,7 +98,7 @@ func (thm *templateHeatmapRow) prepareDataFor(pageColumns []pageColumnTarget) {
 			thm.instrumented[tp], thm.covered[tp]))
 		if !thm.IsDir {
 			thm.FileCoverageLink = append(thm.FileCoverageLink,
-				fmt.Sprintf("/graph/coverage/file?dateto=%s&period=%s&commit=%s&filepath=%s",
+				fmt.Sprintf("/coverage/file?dateto=%s&period=%s&commit=%s&filepath=%s",
 					tp.DateTo.String(),
 					tp.Type,
 					pageColumn.Commit,
@@ -101,18 +110,8 @@ func (thm *templateHeatmapRow) prepareDataFor(pageColumns []pageColumnTarget) {
 		thm.LastDayInstrumented = thm.instrumented[lastDate]
 	}
 	for _, item := range thm.builder {
-		item.prepareDataFor(pageColumns)
+		item.prepareDataFor(pageColumns, skipEmpty)
 	}
-}
-
-type fileCoverageWithDetails struct {
-	Subsystem    string
-	Filepath     string
-	Instrumented int64
-	Covered      int64
-	TimePeriod   coveragedb.TimePeriod `spanner:"-"`
-	Commit       string
-	Subsystems   []string
 }
 
 type pageColumnTarget struct {
@@ -120,7 +119,7 @@ type pageColumnTarget struct {
 	Commit     string
 }
 
-func filesCoverageToTemplateData(fCov []*fileCoverageWithDetails) *templateHeatmap {
+func filesCoverageToTemplateData(fCov []*coveragedb.FileCoverageWithDetails, hideEmpty bool) *templateHeatmap {
 	res := templateHeatmap{
 		Root: &templateHeatmapRow{
 			IsDir:        true,
@@ -153,73 +152,8 @@ func filesCoverageToTemplateData(fCov []*fileCoverageWithDetails) *templateHeatm
 		res.Periods = append(res.Periods, fmt.Sprintf("%s(%d)", tp.DateTo.String(), tp.Days))
 	}
 
-	res.Root.prepareDataFor(targetDateAndCommits)
+	res.Root.prepareDataFor(targetDateAndCommits, hideEmpty)
 	return &res
-}
-
-func filesCoverageWithDetailsStmt(ns, subsystem, manager string, timePeriod coveragedb.TimePeriod) spanner.Statement {
-	if manager == "" {
-		manager = "*"
-	}
-	stmt := spanner.Statement{
-		SQL: `
-select
-  commit,
-  instrumented,
-  covered,
-  files.filepath,
-  subsystems
-from merge_history
-  join files
-    on merge_history.session = files.session
-  join file_subsystems
-    on merge_history.namespace = file_subsystems.namespace and files.filepath = file_subsystems.filepath
-where
-  merge_history.namespace=$1 and dateto=$2 and duration=$3 and manager=$4`,
-		Params: map[string]interface{}{
-			"p1": ns,
-			"p2": timePeriod.DateTo,
-			"p3": timePeriod.Days,
-			"p4": manager,
-		},
-	}
-	if subsystem != "" {
-		stmt.SQL += " and $5=ANY(subsystems)"
-		stmt.Params["p5"] = subsystem
-	}
-	return stmt
-}
-
-func filesCoverageWithDetails(ctx context.Context, projectID string, scope *SelectScope,
-) ([]*fileCoverageWithDetails, error) {
-	client, err := spannerclient.NewClient(ctx, projectID)
-	if err != nil {
-		return nil, fmt.Errorf("spanner.NewClient() failed: %s", err.Error())
-	}
-	defer client.Close()
-
-	res := []*fileCoverageWithDetails{}
-	for _, timePeriod := range scope.Periods {
-		stmt := filesCoverageWithDetailsStmt(scope.Ns, scope.Subsystem, scope.Manager, timePeriod)
-		iter := client.Single().Query(ctx, stmt)
-		defer iter.Stop()
-		for {
-			row, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				return nil, fmt.Errorf("failed to iter.Next() spanner DB: %w", err)
-			}
-			var r fileCoverageWithDetails
-			if err = row.ToStruct(&r); err != nil {
-				return nil, fmt.Errorf("failed to row.ToStruct() spanner DB: %w", err)
-			}
-			r.TimePeriod = timePeriod
-			res = append(res, &r)
-		}
-	}
-	return res, nil
 }
 
 type StyleBodyJS struct {
@@ -245,35 +179,30 @@ func stylesBodyJSTemplate(templData *templateHeatmap,
 		template.HTML(js.Bytes()), nil
 }
 
-type SelectScope struct {
-	Ns        string
-	Subsystem string
-	Manager   string
-	Periods   []coveragedb.TimePeriod
-}
-
-func DoHeatMapStyleBodyJS(ctx context.Context, projectID string, scope *SelectScope, sss, managers []string,
-) (template.CSS, template.HTML, template.HTML, error) {
-	covAndDates, err := filesCoverageWithDetails(ctx, projectID, scope)
+func DoHeatMapStyleBodyJS(
+	ctx context.Context, client spannerclient.SpannerClient, scope *coveragedb.SelectScope, onlyUnique bool,
+	sss, managers []string) (template.CSS, template.HTML, template.HTML, error) {
+	covAndDates, err := coveragedb.FilesCoverageWithDetails(ctx, client, scope, onlyUnique)
 	if err != nil {
-		return "", "", "", fmt.Errorf("failed to filesCoverageWithDetails: %w", err)
+		return "", "", "", fmt.Errorf("failed to FilesCoverageWithDetails: %w", err)
 	}
-	templData := filesCoverageToTemplateData(covAndDates)
+	templData := filesCoverageToTemplateData(covAndDates, onlyUnique)
 	templData.Subsystems = sss
 	templData.Managers = managers
 	return stylesBodyJSTemplate(templData)
 }
 
-func DoSubsystemsHeatMapStyleBodyJS(ctx context.Context, projectID string, scope *SelectScope, sss, managers []string,
-) (template.CSS, template.HTML, template.HTML, error) {
-	covWithDetails, err := filesCoverageWithDetails(ctx, projectID, scope)
+func DoSubsystemsHeatMapStyleBodyJS(
+	ctx context.Context, client spannerclient.SpannerClient, scope *coveragedb.SelectScope, onlyUnique bool,
+	sss, managers []string) (template.CSS, template.HTML, template.HTML, error) {
+	covWithDetails, err := coveragedb.FilesCoverageWithDetails(ctx, client, scope, onlyUnique)
 	if err != nil {
 		panic(err)
 	}
-	var ssCovAndDates []*fileCoverageWithDetails
+	var ssCovAndDates []*coveragedb.FileCoverageWithDetails
 	for _, cwd := range covWithDetails {
 		for _, ssName := range cwd.Subsystems {
-			newRecord := fileCoverageWithDetails{
+			newRecord := coveragedb.FileCoverageWithDetails{
 				Filepath:     cwd.Filepath,
 				Subsystem:    ssName,
 				Instrumented: cwd.Instrumented,
@@ -284,7 +213,7 @@ func DoSubsystemsHeatMapStyleBodyJS(ctx context.Context, projectID string, scope
 			ssCovAndDates = append(ssCovAndDates, &newRecord)
 		}
 	}
-	templData := filesCoverageToTemplateData(ssCovAndDates)
+	templData := filesCoverageToTemplateData(ssCovAndDates, onlyUnique)
 	templData.Managers = managers
 	return stylesBodyJSTemplate(templData)
 }

@@ -24,8 +24,8 @@ import (
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
+	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
-	_ "github.com/google/syzkaller/sys/test/gen" // pull in the test target
 	"github.com/stretchr/testify/assert"
 )
 
@@ -502,7 +502,6 @@ func startRPCServer(t *testing.T, target *prog.Target, executor string,
 		},
 		Executor:    executor,
 		Dir:         dir,
-		Context:     ctx,
 		GDB:         *flagGDB,
 		MaxSignal:   extra.maxSignal,
 		CoverFilter: extra.coverFilter,
@@ -515,7 +514,7 @@ func startRPCServer(t *testing.T, target *prog.Target, executor string,
 	}
 	errc := make(chan error)
 	go func() {
-		err := rpcserver.RunLocal(cfg)
+		err := rpcserver.RunLocal(ctx, cfg)
 		done()
 		errc <- err
 	}()

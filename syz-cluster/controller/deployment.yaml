@@ -23,10 +23,10 @@ spec:
               name: global-config
         ports:
         - containerPort: 8080
-        volumeMounts:
-        - name: blobs-storage-disk
-          mountPath: /blob-storage
-      volumes:
-      - name: blobs-storage-disk
-        persistentVolumeClaim:
-          claimName: blob-storage-disk-claim
+        resources:
+          requests:
+            cpu: 2
+            memory: 8G
+          limits:
+            cpu: 4
+            memory: 16G

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/hash"
-	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
 	"github.com/google/syzkaller/prog"
 )
@@ -30,11 +30,6 @@ type Request struct {
 	Prog        *prog.Prog // for RequestTypeProgram
 	BinaryFile  string     // for RequestTypeBinary
 	GlobPattern string     // for 	RequestTypeGlob
-
-	// If specified, the resulting signal for call SignalFilterCall
-	// will include subset of it even if it's not new.
-	SignalFilter     signal.Signal
-	SignalFilterCall int
 
 	// Return all signal for these calls instead of new signal.
 	ReturnAllSignal []int
@@ -99,12 +94,14 @@ func (r *Request) Done(res *Result) {
 	close(r.done)
 }
 
+var ErrRequestAborted = errors.New("context closed while waiting the result")
+
 // Wait() blocks until we have the result.
 func (r *Request) Wait(ctx context.Context) *Result {
 	r.initChannel()
 	select {
 	case <-ctx.Done():
-		return &Result{Status: ExecFailure}
+		return &Result{Status: ExecFailure, Err: ErrRequestAborted}
 	case <-r.done:
 		return r.result
 	}
@@ -119,9 +116,6 @@ func (r *Request) Validate() error {
 	collectSignal := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectSignal > 0
 	if len(r.ReturnAllSignal) != 0 && !collectSignal {
 		return fmt.Errorf("ReturnAllSignal is set, but FlagCollectSignal is not")
-	}
-	if r.SignalFilter != nil && !collectSignal {
-		return fmt.Errorf("SignalFilter must be used with FlagCollectSignal")
 	}
 	collectComps := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectComps > 0
 	collectCover := r.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectCover > 0
@@ -422,7 +416,6 @@ func (ds *DynamicSourceCtl) Next() *Request {
 // Deduplicator() keeps track of the previously run requests to avoid re-running them.
 type Deduplicator struct {
 	mu     sync.Mutex
-	ctx    context.Context
 	source Source
 	mm     map[hash.Sig]*duplicateState
 }
@@ -432,9 +425,8 @@ type duplicateState struct {
 	queued []*Request // duplicate requests waiting for the result.
 }
 
-func Deduplicate(ctx context.Context, source Source) Source {
+func Deduplicate(source Source) Source {
 	return &Deduplicator{
-		ctx:    ctx,
 		source: source,
 		mm:     map[hash.Sig]*duplicateState{},
 	}
@@ -539,6 +531,8 @@ func (rq *RandomQueue) Next() *Request {
 	return item
 }
 
+var errEvictedFromQueue = errors.New("evicted from the random queue")
+
 func (rq *RandomQueue) Submit(req *Request) {
 	rq.mu.Lock()
 	defer rq.mu.Unlock()
@@ -547,7 +541,10 @@ func (rq *RandomQueue) Submit(req *Request) {
 	} else {
 		pos := rq.rnd.Intn(rq.maxSize + 1)
 		if pos < len(rq.queue) {
-			rq.queue[pos].Done(&Result{Status: ExecFailure})
+			rq.queue[pos].Done(&Result{
+				Status: ExecFailure,
+				Err:    errEvictedFromQueue,
+			})
 			rq.queue[pos] = req
 		}
 	}

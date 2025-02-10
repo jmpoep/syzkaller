@@ -59,26 +59,34 @@ const (
 )
 
 type Session struct {
-	ID         string           `spanner:"ID"`
-	SeriesID   string           `spanner:"SeriesID"`
-	CreatedAt  time.Time        `spanner:"CreatedAt"`
-	FinishedAt spanner.NullTime `spanner:"FinishedAt"`
-	LogURI     string           `spanner:"LogURI"`
+	ID         string             `spanner:"ID"`
+	SeriesID   string             `spanner:"SeriesID"`
+	CreatedAt  time.Time          `spanner:"CreatedAt"`
+	FinishedAt spanner.NullTime   `spanner:"FinishedAt"`
+	SkipReason spanner.NullString `spanner:"SkipReason"`
+	LogURI     string             `spanner:"LogURI"`
 }
 
 func (s *Session) SetFinishedAt(t time.Time) {
 	s.FinishedAt = spanner.NullTime{Time: t, Valid: true}
 }
 
+func (s *Session) SetSkipReason(reason string) {
+	s.SkipReason = spanner.NullString{StringVal: reason, Valid: true}
+}
+
 type SessionTest struct {
 	SessionID      string             `spanner:"SessionID"`
 	BaseBuildID    spanner.NullString `spanner:"BaseBuildID"`
 	PatchedBuildID spanner.NullString `spanner:"PatchedBuildID"`
+	UpdatedAt      time.Time          `spanner:"UpdatedAt"`
 	TestName       string             `spanner:"TestName"`
 	Result         string             `spanner:"Result"`
+	LogURI         string             `spanner:"LogURI"`
 }
 
 type Finding struct {
+	ID        string `spanner:"ID"`
 	SessionID string `spanner:"SessionID"`
 	TestName  string `spanner:"TestName"`
 	Title     string `spanner:"Title"`

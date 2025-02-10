@@ -702,7 +702,7 @@ func initTarget(target *Target, OS, arch string) {
 		target.NeedSyscallDefine = needSyscallDefine
 	}
 	if target.DataOffset == 0 {
-		target.DataOffset = 512 << 20
+		target.DataOffset = target.defaultDataOffset()
 	}
 	target.NumPages = (16 << 20) / target.PageSize
 	sourceDir := getSourceDir(target)
@@ -772,6 +772,18 @@ func initTarget(target *Target, OS, arch string) {
 		target.HostEndian = binary.BigEndian
 	}
 	target.initAddr2Line()
+}
+
+func (target *Target) defaultDataOffset() uint64 {
+	if target.PtrSize == 8 {
+		// An address from ASAN's 64-bit HighMem area.
+		// 0x400000000000 works both for arm64 and amd64. We don't run syzkaller tests on any other platform.
+		// During real fuzzing, we don't build with ASAN, so the address should not matter much as long as
+		// it's far enough from the area allocated by malloc().
+		return 0x400000000000
+	}
+	// From 32-bit HighMem area.
+	return 0x80000000
 }
 
 func (target *Target) initAddr2Line() {

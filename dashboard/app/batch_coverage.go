@@ -14,14 +14,13 @@ import (
 	"cloud.google.com/go/civil"
 	"github.com/google/syzkaller/pkg/coveragedb"
 	"google.golang.org/api/iterator"
-	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/log"
 )
 
 const batchCoverageTimeoutSeconds = 60 * 60 * 12
 
 func handleBatchCoverage(w http.ResponseWriter, r *http.Request) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 	doQuarters := r.FormValue("quarters") == "true"
 	doMonths := r.FormValue("months") == "true"
 	doDays := r.FormValue("days") == "true"
@@ -43,7 +42,7 @@ func handleBatchCoverage(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Errorf(ctx, "failed nsDataAvailable(%s): %s", ns, err)
 		}
-		periodsMerged, rowsMerged, err := coveragedb.NsDataMerged(ctx, "syzkaller", ns)
+		periodsMerged, rowsMerged, err := coveragedb.NsDataMerged(ctx, coverageDBClient, ns)
 		if err != nil {
 			log.Errorf(ctx, "failed coveragedb.NsDataMerged(%s): %s", ns, err)
 		}
@@ -153,8 +152,8 @@ func nsDataAvailable(ctx context.Context, ns string) ([]coveragedb.TimePeriod, [
 }
 
 func handleBatchCoverageClean(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	totalDeleted, err := coveragedb.DeleteGarbage(ctx)
+	ctx := r.Context()
+	totalDeleted, err := coveragedb.DeleteGarbage(ctx, coverageDBClient)
 	if err != nil {
 		errMsg := fmt.Sprintf("failed to coveragedb.DeleteGarbage: %s", err.Error())
 		log.Errorf(ctx, "%s", errMsg)

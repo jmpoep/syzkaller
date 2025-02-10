@@ -1,4 +1,40 @@
 {{define "content"}}
+    <!-- Modal -->
+    <div class="modal fade" tabindex="-1" id="contentModal" role="dialog" aria-labelledby="contentModalLabel" aria-hidden="true">
+      <div class="modal-dialog modal-lg" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="contentModalLabel">Content</h5>&nbsp;
+            <button type="button" class="close" data-bs-dismiss="modal" aria-label="Close">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+          <div class="modal-body">
+            <!-- will be set dynamically -->
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-default" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      $(document).ready(function() {
+          $('a.modal-link-raw').click(function(event) {
+              event.preventDefault();
+              var body = $('#contentModal .modal-body')
+              var url = $(this).attr('href');
+              body.html("")
+              body.load(url, function(response, status, xhr){
+                  if (status == "success") {
+                      body.html("<pre>" + response + "</pre>")
+                  }
+                  $('#contentModal').modal('show');
+              });
+          })
+      });
+    </script>
+
     <div class="container">
         <h2>Patch Series</h2>
         <table class="table table-bordered table-sm">
@@ -35,7 +71,7 @@
                 {{range .Patches}}
                 <tr>
                     <td><a href="{{.Link}}">{{.Title}}</a></td>
-                    <td><a href="/patches/{{.ID}}">[Body]</a></td>
+                    <td><a href="/patches/{{.ID}}" class="modal-link-raw">[Body]</a></td>
                 </tr>
                 {{end}}
            </tbody>
@@ -49,9 +85,15 @@
                     <td>{{.ID}}</a></td>
                 </tr>
                 <tr>
-                    <th><i>Status</i></th>
-                    <td>{{if .FinishedAt.IsNull}}in progress{{else}}finshed{{end}}</a></td>
+                    <th>Status</th>
+                    <td>{{if .FinishedAt.IsNull}}in progress{{else}}finished{{end}}</a></td>
                 </tr>
+                {{if not .SkipReason.IsNull}}
+                <tr>
+                    <th>Skipped</th>
+                    <td>{{.SkipReason.StringVal}}</td>
+                </tr>
+                {{end}}
                 {{if .LogURI}}
                 <tr>
                     <th><i>Execution Log</i></th>
@@ -75,7 +117,12 @@
                     <td>{{.TestName}}</td>
                     <td>{{if .BaseBuild}}{{.BaseBuild.CommitHash}}{{end}}</td>
                     <td>{{if .PatchedBuild}}{{.PatchedBuild.CommitHash}}[patched]{{end}}</td>
-                    <th>{{.Result}}</th>
+                    <th>
+                        {{.Result}}
+                        {{if .LogURI}}
+                            <a href="/sessions/{{.SessionID}}/test_logs?name={{.TestName}}" class="modal-link-raw">[Log]</a>
+                        {{end}}
+                    </th>
                 </tr>
                 {{if .Findings}}
                 <tr>
@@ -84,7 +131,14 @@
                       <tbody>
                       {{range .Findings}}
                       <tr>
-                        <td>{{.Title}}</td>
+                        <td>
+                          {{if .ReportURI}}
+                            <a href="/findings/{{.ID}}/report" class="modal-link-raw">{{.Title}}</a>
+                          {{else}}
+                            {{.Title}}
+                          {{end}}
+                        </td>
+                        <td><a href="/findings/{{.ID}}/log" class="modal-link-raw">[Log]</a></td>
                       </tr>
                       {{end}}
                       </tbody>

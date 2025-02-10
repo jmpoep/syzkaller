@@ -13,6 +13,15 @@ function initTogglers(){
 }
 
 function initUpdateForm(){
+  $('#target-manager').change(function() {
+    if ($(this).val() === '') { // selected "*"
+      $("#unique-only").prop("checked", false);
+      $('#unique-only').prop('disabled', true);
+    } else {
+      $('#unique-only').prop('disabled', false);
+    }
+  });
+
   var curUrlParams = new URLSearchParams(window.location.search);
   $('#target-period').val(curUrlParams.get('period'));
   if (curUrlParams.get('period_count') != null) {
@@ -20,7 +29,8 @@ function initUpdateForm(){
   }
   $('#target-subsystem').val(curUrlParams.get('subsystem'));
   $('#target-manager').val(curUrlParams.get('manager'));
-  $("#only-unique").prop("checked", curUrlParams.get('subsystem') == "1");
+  $("#unique-only").prop("checked", curUrlParams.get('unique-only') == "1");
+  $('#unique-only').prop('disabled', $('#target-manager').val() == '');
 }
 
 // This handler is called when user clicks on the coverage percentage.
@@ -28,6 +38,11 @@ function initUpdateForm(){
 // "#file-content-prev" and "#file-content-curr" are the file content <div>s.
 // "#file-details-prev" and "#file-details-curr" are the corresponding <div>s used to show per-file details.
 function onShowFileContent(url) {
+  var curUrlParams = new URLSearchParams(window.location.search);
+  url += '&subsystem=' + curUrlParams.get('subsystem')
+  url += '&manager=' + curUrlParams.get('manager')
+  url += '&unique-only=' + curUrlParams.get('unique-only')
+
   $.get(url, function(response) {
     $("#file-content-prev").html($("#file-content-curr").html());
     $("#file-content-curr").html(response);

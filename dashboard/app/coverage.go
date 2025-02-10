@@ -8,20 +8,62 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 
 	"cloud.google.com/go/civil"
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/coveragedb"
+	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
 	"github.com/google/syzkaller/pkg/covermerger"
 	"github.com/google/syzkaller/pkg/validator"
+	"google.golang.org/appengine/v2"
 )
 
-type funcStyleBodyJS func(ctx context.Context, projectID string, scope *cover.SelectScope, sss, managers []string,
+var coverageDBClient spannerclient.SpannerClient
+
+func initCoverageDB() {
+	if !appengine.IsAppEngine() {
+		// It is a test environment.
+		// Use SetCoverageDBClient to specify the coveragedb mock or emulator in every test.
+		return
+	}
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	var err error
+	coverageDBClient, err = spannerclient.NewClient(context.Background(), projectID)
+	if err != nil {
+		panic("spanner.NewClient: " + err.Error())
+	}
+}
+
+var keyCoverageDBClient = "coveragedb client key"
+
+func SetCoverageDBClient(ctx context.Context, client spannerclient.SpannerClient) context.Context {
+	return context.WithValue(ctx, &keyCoverageDBClient, client)
+}
+
+func GetCoverageDBClient(ctx context.Context) spannerclient.SpannerClient {
+	client, _ := ctx.Value(&keyCoverageDBClient).(spannerclient.SpannerClient)
+	return client
+}
+
+type funcStyleBodyJS func(
+	ctx context.Context, client spannerclient.SpannerClient,
+	scope *coveragedb.SelectScope, onlyUnique bool, sss, managers []string,
 ) (template.CSS, template.HTML, template.HTML, error)
 
 func handleCoverageHeatmap(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	if r.FormValue("jsonl") == "1" {
+		hdr, err := commonHeader(c, r, w, "")
+		if err != nil {
+			return err
+		}
+		ns := hdr.Namespace
+		repo, _ := getNsConfig(c, ns).mainRepoBranch()
+		w.Header().Set("Content-Type", "application/json")
+		return writeExtAPICoverageFor(c, w, ns, repo)
+	}
 	return handleHeatmap(c, w, r, cover.DoHeatMapStyleBodyJS)
 }
 
@@ -33,6 +75,10 @@ func handleHeatmap(c context.Context, w http.ResponseWriter, r *http.Request, f 
 	hdr, err := commonHeader(c, r, w, "")
 	if err != nil {
 		return err
+	}
+	nsConfig := getNsConfig(c, hdr.Namespace)
+	if nsConfig.Coverage == nil {
+		return ErrClientNotFound
 	}
 	ss := r.FormValue("subsystem")
 	manager := r.FormValue("manager")
@@ -71,16 +117,18 @@ func handleHeatmap(c context.Context, w http.ResponseWriter, r *http.Request, f 
 	slices.Sort(managers)
 	slices.Sort(subsystems)
 
+	onlyUnique := r.FormValue("unique-only") == "1"
+
 	var style template.CSS
 	var body, js template.HTML
-	if style, body, js, err = f(c, "syzkaller",
-		&cover.SelectScope{
+	if style, body, js, err = f(c, GetCoverageDBClient(c),
+		&coveragedb.SelectScope{
 			Ns:        hdr.Namespace,
 			Subsystem: ss,
 			Manager:   manager,
 			Periods:   periods,
 		},
-		subsystems, managers); err != nil {
+		onlyUnique, subsystems, managers); err != nil {
 		return fmt.Errorf("failed to generate heatmap: %w", err)
 	}
 	return serveTemplate(w, "custom_content.html", struct {
@@ -115,10 +163,14 @@ func handleFileCoverage(c context.Context, w http.ResponseWriter, r *http.Reques
 	periodType := r.FormValue("period")
 	targetCommit := r.FormValue("commit")
 	kernelFilePath := r.FormValue("filepath")
+	manager := r.FormValue("manager")
 	if err := validator.AnyError("input validation failed",
 		validator.TimePeriodType(periodType, "period"),
 		validator.CommitHash(targetCommit, "commit"),
 		validator.KernelFilePath(kernelFilePath, "filepath"),
+		validator.AnyOk(
+			validator.Allowlisted(manager, []string{"", "*"}, "manager"),
+			validator.ManagerName(manager, "manager")),
 	); err != nil {
 		return fmt.Errorf("%w: %w", err, ErrClientBadRequest)
 	}
@@ -130,18 +182,40 @@ func handleFileCoverage(c context.Context, w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		return fmt.Errorf("coveragedb.MakeTimePeriod: %w", err)
 	}
+	onlyUnique := r.FormValue("unique-only") == "1"
 	mainNsRepo, _ := nsConfig.mainRepoBranch()
-	hitCounts, err := coveragedb.ReadLinesHitCount(c, hdr.Namespace, targetCommit, kernelFilePath, tp)
+	client := GetCoverageDBClient(c)
+	if client == nil {
+		return fmt.Errorf("spannerdb client is nil")
+	}
+	hitLines, hitCounts, err := coveragedb.ReadLinesHitCount(
+		c, client, hdr.Namespace, targetCommit, kernelFilePath, manager, tp)
+	covMap := coveragedb.MakeCovMap(hitLines, hitCounts)
 	if err != nil {
-		return fmt.Errorf("coveragedb.ReadLinesHitCount: %w", err)
+		return fmt.Errorf("coveragedb.ReadLinesHitCount(%s): %w", manager, err)
+	}
+	if onlyUnique {
+		// This request is expected to be made second by tests.
+		// Moving it to goroutine don't forget to change multiManagerCovDBFixture.
+		allHitLines, allHitCounts, err := coveragedb.ReadLinesHitCount(
+			c, client, hdr.Namespace, targetCommit, kernelFilePath, "*", tp)
+		if err != nil {
+			return fmt.Errorf("coveragedb.ReadLinesHitCount(*): %w", err)
+		}
+		covMap = coveragedb.UniqCoverage(coveragedb.MakeCovMap(allHitLines, allHitCounts), covMap)
+	}
+
+	webGit := getWebGit(c) // Get mock if available.
+	if webGit == nil {
+		webGit = covermerger.MakeWebGit(makeProxyURIProvider(nsConfig.Coverage.WebGitURI))
 	}
 
 	content, err := cover.RendFileCoverage(
 		mainNsRepo,
 		targetCommit,
 		kernelFilePath,
-		makeProxyURIProvider(nsConfig.Coverage.WebGitURI),
-		&covermerger.MergeResult{HitCounts: hitCounts},
+		webGit,
+		&covermerger.MergeResult{HitCounts: covMap},
 		cover.DefaultHTMLRenderConfig())
 	if err != nil {
 		return fmt.Errorf("cover.RendFileCoverage: %w", err)
@@ -151,10 +225,25 @@ func handleFileCoverage(c context.Context, w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+var keyWebGit = "file content provider"
+
+func setWebGit(ctx context.Context, provider covermerger.FileVersProvider) context.Context {
+	return context.WithValue(ctx, &keyWebGit, provider)
+}
+
+func getWebGit(ctx context.Context) covermerger.FileVersProvider {
+	res, _ := ctx.Value(&keyWebGit).(covermerger.FileVersProvider)
+	return res
+}
+
 func handleCoverageGraph(c context.Context, w http.ResponseWriter, r *http.Request) error {
 	hdr, err := commonHeader(c, r, w, "")
 	if err != nil {
 		return err
+	}
+	nsConfig := getNsConfig(c, hdr.Namespace)
+	if nsConfig.Coverage == nil {
+		return ErrClientNotFound
 	}
 	periodType := r.FormValue("period")
 	if periodType == "" {
@@ -163,7 +252,7 @@ func handleCoverageGraph(c context.Context, w http.ResponseWriter, r *http.Reque
 	if periodType != coveragedb.QuarterPeriod && periodType != coveragedb.MonthPeriod {
 		return fmt.Errorf("only quarter and month are allowed, but received %s instead", periodType)
 	}
-	hist, err := MergedCoverage(c, hdr.Namespace, periodType)
+	hist, err := MergedCoverage(c, GetCoverageDBClient(c), hdr.Namespace, periodType)
 	if err != nil {
 		return err
 	}

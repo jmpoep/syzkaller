@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
@@ -41,6 +42,17 @@ func (s *SeriesService) GetSessionSeries(ctx context.Context, sessionID string) 
 		return nil, fmt.Errorf("%w: %q", ErrSessionNotFound, sessionID)
 	}
 	return s.GetSeries(ctx, session.SeriesID)
+}
+
+func (s *SeriesService) SkipSession(ctx context.Context, sessionID string, skip *api.SkipRequest) error {
+	err := s.sessionRepo.Update(ctx, sessionID, func(session *db.Session) error {
+		session.SetSkipReason(skip.Reason)
+		return nil
+	})
+	if errors.Is(err, db.ErrEntityNotFound) {
+		return ErrSessionNotFound
+	}
+	return err
 }
 
 var ErrSeriesNotFound = errors.New("series not found")
@@ -131,26 +143,47 @@ func (s *BuildService) LastBuild(ctx context.Context, req *api.LastBuildReq) (*a
 }
 
 type SessionTestService struct {
-	testRepo *db.SessionTestRepository
+	testRepo    *db.SessionTestRepository
+	blobStorage blob.Storage
 }
 
 func NewSessionTestService(env *app.AppEnvironment) *SessionTestService {
 	return &SessionTestService{
-		testRepo: db.NewSessionTestRepository(env.Spanner),
+		testRepo:    db.NewSessionTestRepository(env.Spanner),
+		blobStorage: env.BlobStorage,
 	}
 }
 
 func (s *SessionTestService) Save(ctx context.Context, req *api.TestResult) error {
-	entity := &db.SessionTest{
-		SessionID: req.SessionID,
-		TestName:  req.TestName,
-		Result:    req.Result,
+	entity, err := s.testRepo.Get(ctx, req.SessionID, req.TestName)
+	if err != nil {
+		return fmt.Errorf("failed to query the test: %w", err)
+	} else if entity == nil {
+		entity = &db.SessionTest{
+			SessionID: req.SessionID,
+			TestName:  req.TestName,
+		}
 	}
+	entity.Result = req.Result
+	entity.UpdatedAt = time.Now()
 	if req.BaseBuildID != "" {
 		entity.BaseBuildID = spanner.NullString{StringVal: req.BaseBuildID, Valid: true}
 	}
 	if req.PatchedBuildID != "" {
 		entity.PatchedBuildID = spanner.NullString{StringVal: req.PatchedBuildID, Valid: true}
+	}
+	if entity.LogURI != "" {
+		err := s.blobStorage.Update(entity.LogURI, bytes.NewReader(req.Log))
+		if err != nil {
+			return fmt.Errorf("failed to update the log: %w", err)
+		}
+	} else if len(req.Log) > 0 {
+		// TODO: it will leak if we fail to save the entity.
+		uri, err := s.blobStorage.Store(bytes.NewReader(req.Log))
+		if err != nil {
+			return fmt.Errorf("failed to save the log: %w", err)
+		}
+		entity.LogURI = uri
 	}
 	return s.testRepo.InsertOrUpdate(context.Background(), entity)
 }

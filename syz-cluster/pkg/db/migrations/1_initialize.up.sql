@@ -53,6 +53,7 @@ CREATE TABLE Sessions (
     SeriesID STRING(36) NOT NULL,
     CreatedAt TIMESTAMP NOT NULL,
     FinishedAt TIMESTAMP,
+    SkipReason STRING(1024),
     LogURI STRING(512) NOT NULL,
     -- TODO: moderation/reporting.
     CONSTRAINT FK_SeriesSessions FOREIGN KEY (SeriesID) REFERENCES Series (ID),
@@ -60,21 +61,28 @@ CREATE TABLE Sessions (
 
 ALTER TABLE Series ADD CONSTRAINT FK_SeriesLatestSession FOREIGN KEY (LatestSessionID) REFERENCES Sessions (ID);
 
--- Tests are filled after they are finished.
+-- Individual tests/steps completed within a session.
 CREATE TABLE SessionTests (
     SessionID STRING(36) NOT NULL, -- UUID
     TestName STRING(256) NOT NULL,
---    Parameters JSON, -- Test-dependent set of parameters.
+    UpdatedAt TIMESTAMP NOT NULL,
     Result STRING(36) NOT NULL,
     BaseBuildID STRING(36),
     PatchedBuildID STRING(36),
+    LogURI STRING(256) NOT NULL,
     CONSTRAINT FK_SessionResults FOREIGN KEY (SessionID) REFERENCES Sessions (ID),
     CONSTRAINT ResultEnum CHECK (Result IN ('passed', 'failed', 'error', 'running')),
     CONSTRAINT FK_BaseBuild FOREIGN KEY (BaseBuildID) REFERENCES Builds (ID),
     CONSTRAINT FK_PatchedBuild FOREIGN KEY (PatchedBuildID) REFERENCES Builds (ID),
 ) PRIMARY KEY(SessionID, TestName);
 
+/*
+  Findings are build/boot errors or crashes found during processing the patch series.
+  One could have used (SessionID, TestName, Title) as a key, but that becomes very inconvenient
+  if the Finding is to be referenced from multiple places.
+*/
 CREATE TABLE Findings (
+    ID STRING(36) NOT NULL, -- UUID
     SessionID STRING(36) NOT NULL,
     TestName STRING(256) NOT NULL,
     Title STRING(256) NOT NULL,
@@ -82,4 +90,6 @@ CREATE TABLE Findings (
     LogURI STRING(256) NOT NULL,
     CONSTRAINT FK_SessionCrashes FOREIGN KEY (SessionID) REFERENCES Sessions (ID),
     CONSTRAINT FK_TestCrashes FOREIGN KEY (SessionID, TestName) REFERENCES SessionTests (SessionID, TestName),
-) PRIMARY KEY(SessionID, TestName, Title);
+) PRIMARY KEY (ID);
+
+CREATE UNIQUE INDEX NoDupFindings ON Findings(SessionID, TestName, Title);

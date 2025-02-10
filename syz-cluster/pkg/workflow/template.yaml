@@ -7,6 +7,13 @@ metadata:
   generateName: series-workflow
 spec:
   entrypoint: main
+  podGC:
+    # Keep pods for 12 hours after completion.
+    strategy: OnPodCompletion
+    deleteDelayDuration: 12h
+  ttlStrategy:
+    # Keep finihed workflows for 12 hours after completion.
+    secondsAfterCompletion: 43200
   arguments:
     parameters:
       - name: session-id
@@ -26,9 +33,9 @@ spec:
             templateRef:
               name: triage-step-template
               template: triage-step
-        - - name: abort-on-skip
+        - - name: abort-on-skip-outcome
             template: exit-workflow
-            when: "{{=jsonpath(steps['run-triage'].outputs.parameters.result, '$.skip') == true}}"
+            when: "{{=jsonpath(steps['run-triage'].outputs.parameters.result, '$.skip') != nil}}"
         - - name: iterate-fuzz
             template: process-fuzz-wrapper
             arguments:
@@ -57,7 +64,7 @@ spec:
               failed: true
         - - name: break-if-succeeded
             template: exit-workflow
-            when: "{{=steps['run-process-fuzz'].status == Succeeded}}"
+            when: "{{steps['run-process-fuzz'].status}} == Succeeded"
     - name: process-fuzz
       inputs:
         parameters:
@@ -137,20 +144,25 @@ spec:
                   value: "true"
                 - name: test-name
                   value: "Boot test: Patched"
-        - - name: break-if-base-boot-failed
-            template: exit-workflow
+        - - name: fuzz
+            templateRef:
+              name: fuzz-step-template
+              template: fuzz-step
+            # Proceed only if both boot tests succeeded.
+            when: "{{=jsonpath(steps['boot-test-base'].outputs.parameters.result, '$.success') == true && jsonpath(steps['boot-test-patched'].outputs.parameters.result, '$.success') == true}}"
             arguments:
               parameters:
-                - name: code
-                  value: 0
-            when: "{{=jsonpath(steps['boot-test-base'].outputs.parameters.result, '$.success') == false}}"
-        - - name: break-if-patched-boot-failed
-            template: exit-workflow
-            arguments:
-              parameters:
-                - name: code
-                  value: 0
-            when: "{{=jsonpath(steps['boot-test-patched'].outputs.parameters.result, '$.success') == false}}"
+                - name: config
+                  value: "{{=jsonpath(inputs.parameters.element, '$.config')}}"
+                - name: patched-build-id
+                  value: "{{=jsonpath(steps['patched-build'].outputs.parameters.result, '$.build_id')}}"
+                - name: base-build-id
+                  value: "{{=jsonpath(steps['base-build'].outputs.parameters.result, '$.build_id')}}"
+              artifacts:
+                - name: base-kernel
+                  from: "{{steps.base-build.outputs.artifacts.kernel}}"
+                - name: patched-kernel
+                  from: "{{steps.patched-build.outputs.artifacts.kernel}}"
     - name: extract-request
       inputs:
         parameters:

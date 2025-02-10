@@ -18,8 +18,8 @@ type webGit struct {
 }
 
 func (mr *webGit) GetFileVersions(targetFilePath string, repoCommits ...RepoCommit,
-) (fileVersions, error) {
-	res := make(fileVersions)
+) (FileVersions, error) {
+	res := make(FileVersions)
 	for _, repoCommit := range repoCommits {
 		fileBytes, err := mr.loadFile(targetFilePath, repoCommit.Repo, repoCommit.Commit)
 		// It is ok if some file doesn't exist. It means we have repo FS diff.
@@ -75,13 +75,4 @@ func MakeWebGit(funcProxy FuncProxyURI) FileVersProvider {
 	return &webGit{
 		funcProxy: funcProxy,
 	}
-}
-
-func GetFileVersion(filePath, repo, commit string) (string, error) {
-	repoCommit := RepoCommit{repo, commit}
-	files, err := MakeWebGit(nil).GetFileVersions(filePath, repoCommit)
-	if err != nil {
-		return "", fmt.Errorf("failed to GetFileVersions: %w", err)
-	}
-	return files[repoCommit], nil
 }

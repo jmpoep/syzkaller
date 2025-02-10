@@ -37,8 +37,9 @@ type KernelModule struct {
 
 type Checker struct {
 	checker
-	source       queue.Source
-	checkContext *checkContext
+	cfg      *Config
+	source   queue.Source
+	executor queue.Executor
 }
 
 type Config struct {
@@ -54,7 +55,7 @@ type Config struct {
 	SandboxArg int64
 }
 
-func New(ctx context.Context, cfg *Config) *Checker {
+func New(cfg *Config) *Checker {
 	var impl checker
 	switch cfg.Target.OS {
 	case targets.Linux:
@@ -68,9 +69,10 @@ func New(ctx context.Context, cfg *Config) *Checker {
 	}
 	executor := queue.Plain()
 	return &Checker{
-		checker:      impl,
-		source:       queue.Deduplicate(ctx, executor),
-		checkContext: newCheckContext(ctx, cfg, impl, executor),
+		cfg:      cfg,
+		checker:  impl,
+		executor: executor,
+		source:   queue.Deduplicate(executor),
 	}
 }
 
@@ -99,11 +101,16 @@ func (checker *Checker) MachineInfo(fileInfos []*flatrpc.FileInfo) ([]*KernelMod
 	return modules, info.Bytes(), nil
 }
 
-func (checker *Checker) Run(files []*flatrpc.FileInfo, featureInfos []*flatrpc.FeatureInfo) (
+var ErrAborted = errors.New("aborted through the context")
+
+func (checker *Checker) Run(ctx context.Context, files []*flatrpc.FileInfo, featureInfos []*flatrpc.FeatureInfo) (
 	map[*prog.Syscall]bool, map[*prog.Syscall]string, Features, error) {
-	ctx := checker.checkContext
-	checker.checkContext = nil
-	return ctx.do(files, featureInfos)
+	cc := newCheckContext(ctx, checker.cfg, checker.checker, checker.executor)
+	enabled, disabled, features, err := cc.do(files, featureInfos)
+	if ctx.Err() != nil {
+		return nil, nil, nil, ErrAborted
+	}
+	return enabled, disabled, features, err
 }
 
 // Implementation of the queue.Source interface.

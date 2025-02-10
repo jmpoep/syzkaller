@@ -22,7 +22,7 @@ spec:
             value: "false"
         artifacts:
           - name: kernel
-            path: /kernel
+            path: /base
       container:
         image: boot-step-local
         imagePullPolicy: IfNotPresent

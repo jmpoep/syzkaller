@@ -40,10 +40,10 @@ func DefaultHTMLRenderConfig() *CoverageRenderConfig {
 	}
 }
 
-func RendFileCoverage(repo, forCommit, filePath string, proxy covermerger.FuncProxyURI,
+func RendFileCoverage(repo, forCommit, filePath string, fileProvider covermerger.FileVersProvider,
 	mr *covermerger.MergeResult, renderConfig *CoverageRenderConfig) (string, error) {
 	repoCommit := covermerger.RepoCommit{Repo: repo, Commit: forCommit}
-	files, err := covermerger.MakeWebGit(proxy).GetFileVersions(filePath, repoCommit)
+	files, err := fileProvider.GetFileVersions(filePath, repoCommit)
 	if err != nil {
 		return "", fmt.Errorf("failed to GetFileVersions: %w", err)
 	}
@@ -101,7 +101,7 @@ func GetMergeResult(c context.Context, ns, repo, forCommit, sourceCommit, filePa
 func rendResult(content string, coverage *covermerger.MergeResult, renderConfig *CoverageRenderConfig) string {
 	if coverage == nil {
 		coverage = &covermerger.MergeResult{
-			HitCounts:   map[int]int{},
+			HitCounts:   map[int]int64{},
 			LineDetails: map[int][]*covermerger.FileRecord{},
 		}
 	}

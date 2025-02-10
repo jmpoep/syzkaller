@@ -4,14 +4,18 @@
 package rpcserver
 
 import (
+	"context"
 	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
+	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/rpcserver/mocks"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 )
@@ -212,7 +216,86 @@ func TestHandleConn(t *testing.T) {
 			serv.CreateInstance(1, injectExec, nil)
 
 			go flatrpc.Send(clientConn, tt.req)
-			serv.handleConn(serverConn)
+			err = serv.handleConn(context.Background(), serverConn)
+			if err != nil {
+				t.Fatal(err)
+			}
 		})
+	}
+}
+
+func TestMachineCheckCrash(t *testing.T) {
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64Fuzz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysTarget := targets.Get(target.OS, target.Arch)
+	if sysTarget.BrokenCompiler != "" {
+		t.Skipf("skipping, broken cross-compiler: %v", sysTarget.BrokenCompiler)
+	}
+	executor := csource.BuildExecutor(t, target, "../..")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	checkBegan := make(chan struct{})
+	cfg := &LocalConfig{
+		Config: Config{
+			Config: vminfo.Config{
+				Target:   target,
+				Features: flatrpc.FeatureSandboxNone,
+				Sandbox:  flatrpc.ExecEnvSandboxNone,
+			},
+			Procs:               4,
+			Slowdown:            1,
+			machineCheckStarted: checkBegan,
+		},
+		Executor: executor,
+		Dir:      t.TempDir(),
+	}
+	cfg.MachineChecked = func(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) queue.Source {
+		cancel()
+		return queue.Callback(func() *queue.Request {
+			return nil
+		})
+	}
+
+	local, ctx, err := setupLocal(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopDone := make(chan error)
+	go func() {
+		loopDone <- local.Serve(ctx)
+	}()
+
+	t.Logf("starting the first instance")
+	firstCtx, firstCancel := context.WithCancel(ctx)
+	firstCh := make(chan error)
+	go func() {
+		firstCh <- local.RunInstance(firstCtx, 0)
+	}()
+
+	t.Logf("wait for the machine check to begin")
+	<-checkBegan
+
+	t.Logf("kill the first instance")
+	firstCancel()
+	if err := <-firstCh; err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("restart the instance")
+	secondCh := make(chan error)
+	go func() {
+		secondCh <- local.RunInstance(ctx, 0)
+	}()
+
+	t.Logf("await the completion")
+	if err := <-loopDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondCh; err != nil {
+		t.Fatal(err)
 	}
 }

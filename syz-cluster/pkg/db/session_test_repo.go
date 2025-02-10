@@ -57,6 +57,19 @@ func (repo *SessionTestRepository) InsertOrUpdate(ctx context.Context, test *Ses
 	return err
 }
 
+func (repo *SessionTestRepository) Get(ctx context.Context, sessionID, testName string) (*SessionTest, error) {
+	stmt := spanner.Statement{
+		SQL: "SELECT * FROM `SessionTests` WHERE `SessionID` = @session AND `TestName` = @name",
+		Params: map[string]interface{}{
+			"session": sessionID,
+			"name":    testName,
+		},
+	}
+	iter := repo.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	return readOne[SessionTest](iter)
+}
+
 type FullSessionTest struct {
 	*SessionTest
 	BaseBuild    *Build
@@ -66,7 +79,7 @@ type FullSessionTest struct {
 func (repo *SessionTestRepository) BySession(ctx context.Context, sessionID string) ([]*FullSessionTest, error) {
 	stmt := spanner.Statement{
 		SQL: "SELECT * FROM `SessionTests` WHERE `SessionID` = @session" +
-			" ORDER BY `TestName`",
+			" ORDER BY `UpdatedAt`",
 		Params: map[string]interface{}{"session": sessionID},
 	}
 	iter := repo.client.Single().Query(ctx, stmt)

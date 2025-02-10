@@ -106,6 +106,7 @@ type Manager struct {
 	benchFile *os.File
 
 	assetStorage *asset.Storage
+	fsckChecker  image.FsckChecker
 
 	reproLoop *manager.ReproLoop
 
@@ -310,6 +311,13 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	if err := mgr.serv.Listen(); err != nil {
 		log.Fatalf("failed to start rpc server: %v", err)
 	}
+	ctx := vm.ShutdownCtx()
+	go func() {
+		err := mgr.serv.Serve(ctx)
+		if err != nil {
+			log.Fatalf("%s", err)
+		}
+	}()
 	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Port())
 
 	if cfg.DashboardAddr != "" {
@@ -355,9 +363,13 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	mgr.http.ReproLoop = mgr.reproLoop
 	mgr.http.TogglePause = mgr.pool.TogglePause
 
-	ctx := vm.ShutdownCtx()
 	if mgr.cfg.HTTP != "" {
-		go mgr.http.Serve()
+		go func() {
+			err := mgr.http.Serve(ctx)
+			if err != nil {
+				log.Fatalf("failed to serve HTTP: %v", err)
+			}
+		}()
 	}
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
@@ -541,7 +553,10 @@ func (mgr *Manager) processRepro(res *manager.ReproResult) {
 }
 
 func (mgr *Manager) preloadCorpus() {
-	info := manager.LoadSeeds(mgr.cfg, false)
+	info, err := manager.LoadSeeds(mgr.cfg, false)
+	if err != nil {
+		log.Fatalf("failed to load corpus: %v", err)
+	}
 	mgr.fresh = info.Fresh
 	mgr.corpusDB = info.CorpusDB
 	mgr.corpusPreload <- info.Candidates
@@ -930,10 +945,11 @@ func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
 			return
 		}
 		// Report file systems that fail fsck with a separate tag.
-		if mgr.cfg.RunFsck && dashTyp == dashapi.MountInRepro && c.Meta.Attrs.Fsck != "" {
+		if mgr.cfg.RunFsck && dashTyp == dashapi.MountInRepro &&
+			c.Meta.Attrs.Fsck != "" && mgr.fsckChecker.Exists(c.Meta.Attrs.Fsck) {
 			logs, isClean, err := image.Fsck(r2, c.Meta.Attrs.Fsck)
 			if err != nil {
-				log.Logf(1, "fsck of the asset %v failed: %v", name, err)
+				log.Errorf("fsck of the asset %v failed: %v", name, err)
 			} else {
 				asset.FsckLog = logs
 				asset.FsIsClean = isClean
@@ -1080,9 +1096,10 @@ func (mgr *Manager) BugFrames() (leaks, races []string) {
 	return
 }
 
-func (mgr *Manager) MachineChecked(features flatrpc.Feature, enabledSyscalls map[*prog.Syscall]bool) queue.Source {
+func (mgr *Manager) MachineChecked(features flatrpc.Feature,
+	enabledSyscalls map[*prog.Syscall]bool) (queue.Source, error) {
 	if len(enabledSyscalls) == 0 {
-		log.Fatalf("all system calls are disabled")
+		return nil, fmt.Errorf("all system calls are disabled")
 	}
 	if mgr.mode.ExitAfterMachineCheck {
 		mgr.exit(mgr.mode.Name)
@@ -1157,15 +1174,15 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature, enabledSyscalls map
 			mgr.serv = nil
 			return queue.Callback(func() *queue.Request {
 				return nil
-			})
+			}), nil
 		}
-		return source
+		return source, nil
 	} else if mgr.mode == ModeCorpusRun {
 		ctx := &corpusRunner{
 			candidates: candidates,
 			rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
 		}
-		return queue.DefaultOpts(ctx, opts)
+		return queue.DefaultOpts(ctx, opts), nil
 	} else if mgr.mode == ModeRunTests {
 		ctx := &runtest.Context{
 			Dir:      filepath.Join(mgr.cfg.Syzkaller, "sys", mgr.cfg.Target.OS, "test"),
@@ -1187,7 +1204,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature, enabledSyscalls map
 			}
 			mgr.exit("tests")
 		}()
-		return ctx
+		return ctx, nil
 	} else if mgr.mode == ModeIfaceProbe {
 		exec := queue.Plain()
 		go func() {
@@ -1201,7 +1218,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature, enabledSyscalls map
 			}
 			mgr.exit("interface probe")
 		}()
-		return exec
+		return exec, nil
 	}
 	panic(fmt.Sprintf("unexpected mode %q", mgr.mode.Name))
 }
@@ -1422,11 +1439,11 @@ func (mgr *Manager) dashboardReproTasks() {
 	}
 }
 
-func (mgr *Manager) CoverageFilter(modules []*vminfo.KernelModule) []uint64 {
+func (mgr *Manager) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
 	mgr.reportGenerator.Init(modules)
 	filters, err := manager.PrepareCoverageFilters(mgr.reportGenerator, mgr.cfg, true)
 	if err != nil {
-		log.Fatalf("failed to init coverage filter: %v", err)
+		return nil, fmt.Errorf("failed to init coverage filter: %w", err)
 	}
 	mgr.coverFilters = filters
 	mgr.http.Cover.Store(&manager.CoverageInfo{
@@ -1438,7 +1455,7 @@ func (mgr *Manager) CoverageFilter(modules []*vminfo.KernelModule) []uint64 {
 	for pc := range filters.ExecutorFilter {
 		pcs = append(pcs, pc)
 	}
-	return pcs
+	return pcs, nil
 }
 
 func publicWebAddr(addr string) string {
